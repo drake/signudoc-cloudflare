@@ -1,15 +1,22 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
+import { BUCKET_PLACEHOLDER, sendEmail, serveStorage } from "./gateways.mjs";
+
 // Runs SignuDoc on Cloudflare. The app itself is the Next.js server in a
 // container (see ./Dockerfile). This Worker is the front door: it starts
 // the container when a request arrives, passes every request to it, and
 // calls the daily cleanup on a schedule.
 //
-// It also gives the app its documents and its email without any keys. The
-// app asks for both over plain HTTP at two names that exist only inside the
-// container. Requests to those names never leave Cloudflare: they are
-// handed to the two gateways below, which use this Worker's own R2 bucket
-// and email binding.
+// It also gives the app its documents and its email without any Cloudflare
+// keys. The app asks for both over plain HTTP at two names that exist only
+// inside the container. Requests to those names never leave Cloudflare:
+// they are handed to the two gateways below, which use this Worker's own R2
+// bucket and email binding.
+//
+// The gateways answer only a request that carries this install's gateway
+// token (see ./gateways.mjs). The token is made here and given to the app
+// when its container starts, so a request the app is tricked into making to
+// one of those names is refused.
 //
 // Plain JavaScript, so the app's own typecheck leaves it alone.
 
@@ -24,150 +31,18 @@ const INSTANCE_NAME = "app";
 
 const STORAGE_HOST = "storage.signudoc.internal";
 const EMAIL_HOST = "email.signudoc.internal";
-// The app's S3 driver puts a bucket name first in every path. There is one
-// bucket, the one bound to this Worker, so the name is only a placeholder.
-const BUCKET_PLACEHOLDER = "documents";
 
-/**
- * The app's document storage, on this Worker's R2 bucket. It answers the
- * four S3-style calls the app's storage driver makes (see
- * src/lib/services/storage/s3.ts): GET, HEAD, PUT and DELETE of one object.
- */
+/** The app's document storage, on this Worker's R2 bucket. */
 export class StorageGateway extends WorkerEntrypoint {
-  async fetch(request) {
-    const path = decodeURIComponent(new URL(request.url).pathname);
-    const prefix = `/${BUCKET_PLACEHOLDER}/`;
-
-    if (!path.startsWith(prefix) || path.length === prefix.length) {
-      return new Response("InvalidRequest", { status: 400 });
-    }
-
-    const key = path.slice(prefix.length);
-    const bucket = this.env.DOCUMENTS;
-
-    switch (request.method) {
-      case "GET":
-      case "HEAD": {
-        const object =
-          request.method === "GET"
-            ? await bucket.get(key)
-            : await bucket.head(key);
-
-        if (!object) {
-          return new Response(request.method === "GET" ? "NoSuchKey" : null, {
-            status: 404,
-          });
-        }
-
-        const headers = new Headers({
-          "content-length": String(object.size),
-          etag: object.httpEtag,
-        });
-
-        if (object.httpMetadata?.contentType) {
-          headers.set("content-type", object.httpMetadata.contentType);
-        }
-
-        return new Response(request.method === "GET" ? object.body : null, {
-          headers,
-        });
-      }
-      case "PUT": {
-        // "If-None-Match: *" asks R2 to keep an object that is already
-        // there. R2 then stores nothing and answers null.
-        const stored = await bucket.put(key, await request.arrayBuffer(), {
-          httpMetadata: {
-            contentType: request.headers.get("content-type") ?? undefined,
-          },
-          onlyIf:
-            request.headers.get("if-none-match") === "*"
-              ? new Headers({ "if-none-match": "*" })
-              : undefined,
-        });
-
-        return stored
-          ? new Response(null, { headers: { etag: stored.httpEtag } })
-          : new Response("PreconditionFailed", { status: 412 });
-      }
-      case "DELETE":
-        await bucket.delete(key);
-
-        return new Response(null, { status: 204 });
-      default:
-        return new Response("MethodNotAllowed", { status: 405 });
-    }
+  fetch(request) {
+    return serveStorage(request, this.env.DOCUMENTS, this.ctx.props?.token);
   }
 }
 
-function fromBase64(value) {
-  return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
-}
-
-function errorAnswer(status, message) {
-  return Response.json(
-    { errors: [{ message }], result: null, success: false },
-    { status },
-  );
-}
-
-/**
- * The app's outgoing email, on this Worker's email binding. It takes the
- * request the app's Cloudflare email driver makes (the shape of the Email
- * Service REST API, see src/lib/services/email-cloudflare.ts) and answers
- * in the same shape.
- */
+/** The app's outgoing email, on this Worker's email binding. */
 export class EmailGateway extends WorkerEntrypoint {
-  async fetch(request) {
-    if (request.method !== "POST") {
-      return errorAnswer(405, "Method not allowed.");
-    }
-
-    const message = await request.json().catch(() => null);
-
-    if (!message || typeof message !== "object") {
-      return errorAnswer(400, "Invalid email request.");
-    }
-
-    try {
-      await this.env.EMAIL.send({
-        ...(message.attachments?.length
-          ? {
-              attachments: message.attachments.map((attachment) => ({
-                content: fromBase64(attachment.content),
-                disposition: attachment.disposition ?? "attachment",
-                filename: attachment.filename,
-                type: attachment.type,
-              })),
-            }
-          : {}),
-        from:
-          typeof message.from === "string"
-            ? message.from
-            : { email: message.from.address, name: message.from.name },
-        ...(message.html ? { html: message.html } : {}),
-        ...(message.reply_to ? { replyTo: message.reply_to } : {}),
-        subject: message.subject,
-        text: message.text,
-        to: message.to,
-      });
-    } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
-      const code = error?.code ?? "";
-
-      // The driver tries again after a 429 or a 5xx, and gives up on
-      // anything else. Only a rate limit is worth another try.
-      return errorAnswer(code === "E_RATE_LIMIT_EXCEEDED" ? 429 : 400, text);
-    }
-
-    return Response.json({
-      errors: [],
-      result: {
-        delivered: [],
-        permanent_bounces: [],
-        queued: [message.to].flat(),
-      },
-      success: true,
-    });
+  fetch(request) {
+    return sendEmail(request, this.env.EMAIL, this.ctx.props?.token);
   }
 }
 
@@ -240,38 +115,48 @@ export class SignuDocApp extends DurableObject {
     return this.ctx.container.getTcpPort(PORT).fetch(forwarded);
   }
 
-  /** A secret for signing sessions, made once and kept with this object. */
-  async authSecret() {
-    let secret = await this.ctx.storage.get("authSecret");
+  /** A secret made once for this install and kept with this object. */
+  async storedSecret(name) {
+    let secret = await this.ctx.storage.get(name);
 
     if (!secret) {
       secret = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
         byte.toString(16).padStart(2, "0"),
       ).join("");
-      await this.ctx.storage.put("authSecret", secret);
+      await this.ctx.storage.put(name, secret);
     }
 
     return secret;
   }
 
+  /** What the app must present to the two gateways. */
+  gatewayToken() {
+    return this.storedSecret("gatewayToken");
+  }
+
   /** The environment the app is started with. */
   async containerEnv() {
+    const gatewayToken = await this.gatewayToken();
+
     return {
       // The address the site was first opened at. Set APP_URL on the
       // Worker to use another, such as a domain of your own.
       APP_URL: (await this.ctx.storage.get("appUrl")) ?? "",
-      BETTER_AUTH_SECRET: await this.authSecret(),
-      // Documents and email through the gateways above. The keys are
-      // placeholders: the gateways are only reachable from inside the
-      // container, and do not check them.
+      // Signs sessions.
+      BETTER_AUTH_SECRET: await this.storedSecret("authSecret"),
+      // Documents and email through the gateways above. Both drivers send
+      // the gateway token with every request: the email driver as its API
+      // token, the storage driver as its access key id.
       CLOUDFLARE_ACCOUNT_ID: "internal",
-      CLOUDFLARE_EMAIL_API_TOKEN: "internal",
+      CLOUDFLARE_EMAIL_API_TOKEN: gatewayToken,
       CLOUDFLARE_EMAIL_API_URL: `http://${EMAIL_HOST}/send`,
       EMAIL_DRIVER: "cloudflare",
-      S3_ACCESS_KEY_ID: "internal",
+      S3_ACCESS_KEY_ID: gatewayToken,
       S3_BUCKET: BUCKET_PLACEHOLDER,
       S3_ENDPOINT: `http://${STORAGE_HOST}`,
-      S3_SECRET_ACCESS_KEY: "internal",
+      // The driver needs one to sign with. The gateway does not check the
+      // signature, only the token.
+      S3_SECRET_ACCESS_KEY: gatewayToken,
       STORAGE_DRIVER: "s3",
       // Every setting and secret of this Worker, which win over the
       // defaults above. A setting SignuDoc adds later works without a
@@ -307,14 +192,16 @@ export class SignuDocApp extends DurableObject {
 
     if (!container.running) {
       // Intercepts last until the container stops, so they are set at
-      // every start.
+      // every start. Each gateway is told the token to ask for.
+      const props = { token: await this.gatewayToken() };
+
       await container.interceptOutboundHttp(
         STORAGE_HOST,
-        this.ctx.exports.StorageGateway,
+        this.ctx.exports.StorageGateway({ props }),
       );
       await container.interceptOutboundHttp(
         EMAIL_HOST,
-        this.ctx.exports.EmailGateway,
+        this.ctx.exports.EmailGateway({ props }),
       );
 
       console.log(`Starting the SignuDoc container for ${env.APP_URL}.`);

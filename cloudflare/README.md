@@ -22,7 +22,7 @@ You also need:
 - a Cloudflare account on the Workers Paid plan, because Containers and Email Sending are not on the free plan;
 - a domain on that account with Email Sending turned on, before the site can send email.
 
-No API tokens or access keys are needed. The app asks the Worker for its documents and its email, and the Worker uses its own bindings (see `worker.mjs`).
+No API tokens or access keys are needed. The app asks the Worker for its documents and its email, and the Worker uses its own bindings (see `worker.mjs`). The Worker makes a token for each install, gives it to the app when the container starts, and answers only requests for documents or email that carry it.
 
 ## Set it up
 
