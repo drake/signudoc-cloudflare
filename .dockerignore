@@ -4,6 +4,8 @@
 .data
 node_modules
 cloudflare
+# A test under src/ imports this one, and the build type-checks the tests.
+!cloudflare/gateways.mjs
 docs
 e2e
 test-results
